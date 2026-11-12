@@ -1,184 +1,244 @@
+import hashlib
+import json
 import os
+import re
+from datetime import datetime, timedelta, timezone
+
+import redis
 import requests
 import spacy
-import sqlite3
-import json
-from datetime import datetime, timezone
 from dotenv import load_dotenv
-from geopy.geocoders import Nominatim
-from geopy.extra.rate_limiter import RateLimiter
 from geopy.distance import geodesic
+from geopy.extra.rate_limiter import RateLimiter
+from geopy.geocoders import Nominatim
 
 # ------------------------------------
 # 1. CONFIGURATION
 # ------------------------------------
-
 load_dotenv()
 
 NEWS_API_KEY = os.getenv("NEWS_API_KEY")
-
-NEWS_URL = "https://newsapi.org/v2"
-
-# Change these according to the user's location.
-USER_CITY = "Bengaluru"
-USER_COUNTRY = "India"
-
-# User coordinates can be received
-# from your Python backend.
-USER_LAT = 12.9716
-USER_LON = 77.5946
-
-RADIUS_KM = 20
-
 if not NEWS_API_KEY:
     raise ValueError("Please add NEWS_API_KEY in your .env file")
+
+NEWS_URL = "https://newsapi.org/v2"
+ARTICLE_TTL_SECONDS = 86400  # 24 hours auto-expiration
+
+# Connect to Redis
+r = redis.Redis(host="localhost", port=6379, db=0, decode_responses=True)
 
 # Load NLP model
 nlp = spacy.load("en_core_web_sm")
 
+# Setup Nominatim with strict rate limiting (1 req/sec)
+geolocator = Nominatim(user_agent="city_news_engine_v1")
+geocode = RateLimiter(geolocator.geocode, min_delay_seconds=1.1)
+
+# City aliases so "Bangalore" and "Bengaluru" map to the same city bucket
+CITY_ALIASES = {
+    "bengaluru": ["Bengaluru", "Bangalore"],
+    "mumbai": ["Mumbai", "Bombay"],
+    "delhi": ["Delhi", "New Delhi"],
+    "chennai": ["Chennai", "Madras"],
+    "kolkata": ["Kolkata", "Calcutta"]
+}
+
+LOCAL_LANDMARKS = [
+    "Koramangala", "Indiranagar", "Whitefield", "HSR Layout", "BTM Layout",
+    "Marathahalli", "Electronic City", "Jayanagar", "Malleshwaram", "Hebbal",
+    "Yelahanka", "MG Road", "Brigade Road", "Bellandur", "Sarjapur"
+]
 
 # ------------------------------------
 # 2. NEWS CATEGORIES
 # ------------------------------------
-
 NEWS_CATEGORIES = {
-    "trending": {
-        "type": "top-headlines",
-        "category": "general"
-    },
-
-    "current_affairs": {
-        "type": "top-headlines",
-        "category": "general"
-    },
-
-    "business": {
-        "type": "top-headlines",
-        "category": "business"
-    },
-
-    "trading": {
-        "type": "everything",
-        "query": (
-            '"stock market" OR trading OR NIFTY OR SENSEX '
-            'OR stocks OR cryptocurrency OR investment'
-        )
-    },
-
-    "sports": {
-        "type": "top-headlines",
-        "category": "sports"
-    },
-
-    "technology": {
-        "type": "top-headlines",
-        "category": "technology"
-    },
-
-    "entertainment": {
-        "type": "top-headlines",
-        "category": "entertainment"
-    },
-
-    "health": {
-        "type": "top-headlines",
-        "category": "health"
-    },
-
-    "science": {
-        "type": "top-headlines",
-        "category": "science"
-    },
-
-    "local_news": {
-        "type": "everything",
-        "query": None
-    }
+    "local_news": '({city_query})',
+    "trending": '({city_query}) AND (breaking OR trending OR alert OR traffic OR civic)',
+    "business": '({city_query}) AND (business OR startup OR funding OR company OR economy)',
+    "trading": '({city_query}) AND ("stock market" OR trading OR NIFTY OR SENSEX OR stocks)',
+    "sports": '({city_query}) AND (sports OR cricket OR RCB OR ISL OR BFC OR stadium)',
+    "technology": '({city_query}) AND (technology OR AI OR software OR IT OR tech)',
+    "entertainment": '({city_query}) AND (entertainment OR cinema OR concert OR event OR festival)',
+    "health": '({city_query}) AND (health OR hospital OR medical OR wellness)',
+    "science": '({city_query}) AND (science OR ISRO OR IISc OR research OR space)'
 }
 
-
 # ------------------------------------
-# 3. FETCH NEWS FROM NEWS API
+# 3. LOCATION EXTRACTION & CACHED GEOCODING
 # ------------------------------------
+def build_city_query(city: str) -> str:
+    """Build an OR query string covering city aliases (e.g., Bengaluru OR Bangalore)."""
+    aliases = CITY_ALIASES.get(city.lower(), [city])
+    return " OR ".join(f'"{alias}"' for alias in aliases)
 
-def fetch_news(genre):
 
-    config = NEWS_CATEGORIES.get(genre)
+def extract_location_name(text: str, default_city: str) -> str:
+    """Extract neighborhood if mentioned, otherwise default to the city center."""
+    for landmark in LOCAL_LANDMARKS:
+        if re.search(rf"\b{re.escape(landmark)}\b", text, re.IGNORECASE):
+            return f"{landmark}, {default_city}, India"
 
-    if not config:
-        return []
+    doc = nlp(text)
+    for ent in doc.ents:
+        if ent.label_ in ("GPE", "LOC", "FAC"):
+            place = ent.text.strip()
+            if place.lower() not in ("india", "karnataka", "bengaluru", "bangalore"):
+                return f"{place}, {default_city}, India"
 
-    if config["type"] == "top-headlines":
+    return f"{default_city}, India"
 
-        params = {
-            "country": "in",
-            "category": config["category"],
-            "pageSize": 50,
-            "apiKey": NEWS_API_KEY
-        }
 
-        endpoint = f"{NEWS_URL}/top-headlines"
-
-    else:
-
-        query = config["query"]
-
-        if genre == "local_news":
-            query = (
-                f'"{USER_CITY}" OR "{USER_COUNTRY}"'
-            )
-
-        params = {
-            "q": query,
-            "language": "en",
-            "sortBy": "publishedAt",
-            "pageSize": 50,
-            "apiKey": NEWS_API_KEY
-        }
-
-        endpoint = f"{NEWS_URL}/everything"
+def get_cached_coordinates(location_query: str) -> tuple[float, float] | None:
+    """Resolve location to (lat, lon) using Redis cache."""
+    cache_key = f"geocode:{location_query.lower().strip()}"
+    cached = r.get(cache_key)
+    if cached:
+        lat, lon = json.loads(cached)
+        return (lat, lon)
 
     try:
+        location = geocode(location_query)
+        if location:
+            coords = [location.latitude, location.longitude]
+            r.set(cache_key, json.dumps(coords))
+            return (location.latitude, location.longitude)
+    except Exception as e:
+        print(f"Geocoding error for '{location_query}': {e}")
 
-        response = requests.get(
-            endpoint,
-            params=params,
-            timeout=15
-        )
+    return None
 
+# ------------------------------------
+# 4. FETCH & INGEST BY CITY
+# ------------------------------------
+def fetch_and_ingest_news(genre: str, user_city: str = "Bengaluru") -> int:
+    """Fetch articles for a city from NewsAPI and index them in Redis by city."""
+    query_template = NEWS_CATEGORIES.get(genre)
+    if not query_template:
+        return 0
+
+    city_query = build_city_query(user_city)
+    query = query_template.format(city_query=city_query)
+    from_date = (datetime.now(timezone.utc) - timedelta(days=3)).strftime("%Y-%m-%d")
+
+    params = {
+        "q": query,
+        "language": "en",
+        "from": from_date,
+        "sortBy": "publishedAt",
+        "pageSize": 30,  # Reduced from 50 to keep data lightweight
+        "apiKey": NEWS_API_KEY
+    }
+
+    try:
+        response = requests.get(f"{NEWS_URL}/everything", params=params, timeout=15)
         response.raise_for_status()
-
         data = response.json()
 
         if data.get("status") != "ok":
             print("News API error:", data)
-            return []
+            return 0
 
-        articles = data.get("articles", [])
+        city_key = f"city:{user_city.lower().strip()}"
+        ingested_count = 0
 
-        results = []
-
-        for article in articles:
-
-            if not article.get("title"):
+        for article in data.get("articles", []):
+            title = article.get("title")
+            url = article.get("url")
+            if not title or not url or title == "[Removed]":
                 continue
 
-            results.append({
-                "genre": genre,
-                "title": article.get("title"),
-                "description": article.get("description"),
-                "content": article.get("content"),
-                "source": (
-                    article.get("source") or {}
-                ).get("name"),
-                "url": article.get("url"),
-                "image": article.get("urlToImage"),
-                "published_at": article.get("publishedAt")
-            })
+            article_id = hashlib.sha256(url.encode("utf-8")).hexdigest()[:16]
+            redis_article_key = f"article:{article_id}"
 
-        return results
+            # Still add to this city's set even if article was already fetched
+            r.sadd(city_key, article_id)
+
+            if r.exists(redis_article_key):
+                continue
+
+            description = article.get("description") or ""
+            combined_text = f"{title}. {description}"
+
+            # Geocode (falls back smoothly to city center if no neighborhood found)
+            location_str = extract_location_name(combined_text, user_city)
+            coords = get_cached_coordinates(location_str)
+            lat, lon = coords if coords else (0.0, 0.0)
+
+            article_payload = {
+                "id": article_id,
+                "city": user_city.lower().strip(),
+                "genre": genre,
+                "title": title,
+                "description": description,
+                "content": article.get("content") or "",
+                "source": (article.get("source") or {}).get("name") or "Unknown",
+                "url": url,
+                "image": article.get("urlToImage") or "",
+                "published_at": article.get("publishedAt") or "",
+                "location_name": location_str,
+                "lat": str(lat),
+                "lon": str(lon)
+            }
+
+            pipe = r.pipeline()
+            pipe.hset(redis_article_key, mapping=article_payload)
+            pipe.expire(redis_article_key, ARTICLE_TTL_SECONDS)
+            pipe.execute()
+
+            ingested_count += 1
+
+        return ingested_count
 
     except requests.RequestException as error:
-
         print("News fetching error:", error)
-        return []
+        return 0
+
+# ------------------------------------
+# 5. QUERY BY CITY (NO STRICT 20KM CUTOFF)
+# ------------------------------------
+def get_city_news(
+    user_city: str,
+    user_lat: float | None = None,
+    user_lon: float | None = None,
+    genre: str | None = None,
+    limit: int = 25
+) -> list[dict]:
+    """Retrieve all cached articles for a city, optionally calculating distance for display."""
+    city_key = f"city:{user_city.lower().strip()}"
+    article_ids = r.smembers(city_key)
+
+    results = []
+    for article_id in article_ids:
+        article_data = r.hgetall(f"article:{article_id}")
+        if not article_data:
+            # Clean up expired article ID from city set
+            r.srem(city_key, article_id)
+            continue
+
+        if genre and article_data.get("genre") != genre:
+            continue
+
+        # Calculate distance purely as a helpful label (no hard cutoff)
+        art_lat = float(article_data.get("lat", 0.0))
+        art_lon = float(article_data.get("lon", 0.0))
+        if user_lat and user_lon and art_lat != 0.0 and art_lon != 0.0:
+            dist = round(geodesic((user_lat, user_lon), (art_lat, art_lon)).km, 1)
+            article_data["distance_km"] = dist
+        else:
+            article_data["distance_km"] = None
+
+        results.append(article_data)
+
+    # Sort newest first
+    results.sort(key=lambda x: x.get("published_at", ""), reverse=True)
+    return results[:limit]
+
+if __name__ == "__main__":
+    added = fetch_and_ingest_news("local_news", user_city="Bengaluru")
+    print(f"Ingested {added} new city articles.")
+
+    city_feed = get_city_news(user_city="Bengaluru", user_lat=12.9716, user_lon=77.5946)
+    for item in city_feed[:5]:
+        dist_label = f"{item['distance_km']} km" if item["distance_km"] is not None else "City-wide"
+        print(f"[{dist_label}] {item['title']} ({item['location_name']})")
